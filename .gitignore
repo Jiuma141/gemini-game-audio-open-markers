@@ -1,0 +1,13 @@
+.DS_Store
+.env
+.env.*
+.venv/
+__pycache__/
+*.py[cod]
+
+# Pilot data and generated artifacts are not part of the source release.
+inputs/
+results/
+
+# Local review-site generator; the public repository contains the annotator.
+build_site_review.py
