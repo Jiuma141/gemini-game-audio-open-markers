@@ -1,29 +1,53 @@
-# Gemini game-audio open-marker annotator
+# Gemini game-audio closed-marker annotator
 
-This repository contains the exact annotation runner used for a frozen
-100-item multilingual Genshin pilot (25 clips each in Chinese, English,
-Japanese, and Korean). Audio and annotation results are intentionally not
+This repository contains the annotation runner used for a frozen multilingual
+Genshin pilot: 200 clips (Chinese, English, Japanese, and Korean) drawn from
+five GCS shards by `prepare_pilot_inputs.py`, whose first 100 rows are the
+original 100-item pilot. Audio and annotation results are intentionally not
 included.
 
 The annotator sends each audio clip together with its official transcript to
-Gemini and requests an ordered sequence of open-vocabulary emotion-state and
-human paralinguistic-event markers. Markers are placed at Unicode character
-boundaries in the original transcript, so long utterances can contain multiple
-emotion states.
+Gemini and requests an ordered sequence of emotion-state and human
+paralinguistic-event markers drawn from a closed vocabulary. Markers are placed
+at Unicode character boundaries in the original transcript, so long utterances
+can contain multiple emotion states.
 
 ## Experiment configuration
 
 - Model: `gemini-3.7-flash`
-- Prompt version: `game-audio-open-marker-sequence-v5`
+- Prompt version: `game-audio-closed-marker-sequence-v15`
 - Temperature: `0`
-- Thinking level: `LOW`
-- Emotion labels: open English `snake_case` vocabulary
-- Event labels: open English `snake_case` vocabulary
-- Concurrency: configurable with `--workers`
+- Thinking level: `MEDIUM` (override with `GEMINI_THINKING_LEVEL`); thought
+  summaries are requested and stored with each result
+- Emotion labels: 87 closed `snake_case` labels covering emotions and
+  vocal-delivery states (e.g. `whisper`, `shouting`, `breathy`)
+- Event labels: 20 closed `snake_case` labels (e.g. `pause`, `laugh`, `sigh`,
+  `inhale`)
+- Alternatives: each marker may list up to 3 alternative labels; primary and
+  alternative confidences share one probability mass (sum ≤ 1)
+- Requests: synchronous `generateContent` calls fanned out over a thread pool
+  (`--workers`); the batch API is not used
+- Context cache: the fixed rule/vocabulary prefix (~1.4k tokens) is stored in
+  an explicit Gemini context cache for the duration of a run and referenced by
+  every request, so only the per-clip input block and audio are sent in full
 - Output: resumable JSONL plus a summary report
 
-The full prompt and JSON response schema are embedded in
-`run_open_markers.py` so the experiment can be audited and reproduced.
+The vocabulary is the `english` column of
+`tts_bracket_emotion_enword_180d.csv`, split into emotion/delivery labels and
+event labels. The full prompt, label lists, and JSON response schema are
+embedded in `run_open_markers.py` so the experiment can be audited and
+reproduced.
+
+Prompt rules worth knowing when reading results:
+
+- Only the acoustics count as evidence. Transcript wording, punctuation, and
+  script conventions (e.g. parentheses marking an aside) must not influence
+  labels.
+- `pause` is reserved for deliberate silent gaps of roughly 0.5 s or more.
+- Confidence is a calibrated probability with explicit anchors (≥0.9 only when
+  no other label is plausible; 0.6–0.8 with one plausible alternative; and so
+  on), not a default quality score.
+- In space-delimited scripts a marker must never split a word.
 
 ## Requirements
 
@@ -35,7 +59,8 @@ The runner uses only the Python standard library.
 
 ## Input files
 
-The pilot expects exactly 100 unique rows in each input set.
+Each input set may contain any number of rows as long as IDs are unique;
+`prepare_pilot_inputs.py` writes the 200-row pilot set to `inputs/`.
 
 `manifest.jsonl` contains one JSON object per audio clip:
 
@@ -72,8 +97,18 @@ python3 run_open_markers.py \
 
 Useful options:
 
-- `--limit N` runs only the first `N` items from the validated 100-item input.
+- `--limit N` runs only the first `N` items of the manifest.
+- `--skip-first N` drops the first `N` rows before selection, and
+  `--sample N --seed S` picks `N` random rows from what remains; combine them
+  to evaluate on a held-out random subset (e.g. `--skip-first 10 --sample 10`).
+- `--ids a,b` keeps only rows whose ID contains one of the given substrings,
+  for spot-checking individual clips.
 - `--max-attempts N` controls retry attempts per item; the default is 4.
+  Responses that fail validation (out-of-vocabulary label, mid-word index,
+  overconfident alternatives, …) are retried.
+- `--no-cache` sends the full prompt with every request instead of creating an
+  explicit context cache. `GEMINI_CACHE_TTL_SECONDS` (default 7200) bounds the
+  cache lifetime; the cache is deleted when the run finishes.
 - Re-running the same command resumes completed items whose configuration hash
   matches the current model, prompt, schema, and generation settings.
 
@@ -85,26 +120,38 @@ Gemini returns a JSON array such as:
 [
   {
     "type": "emotion",
-    "label": "weary_resignation",
-    "intensity": 0.61,
-    "confidence": 0.88,
+    "label": "tired",
+    "confidence": 0.62,
+    "alternatives": [{"label": "sad", "confidence": 0.25}],
     "insert_char_index": 0,
     "placement_confidence": 0.97
   },
   {
     "type": "event",
-    "label": "sighing",
-    "confidence": 0.94,
+    "label": "sigh",
+    "confidence": 0.91,
+    "alternatives": [],
     "insert_char_index": 0,
     "placement_confidence": 0.96
   }
 ]
 ```
 
+Validation enforces the closed vocabulary, index bounds and word boundaries,
+a first emotion marker at index 0, no consecutive duplicate emotion labels, and
+the probability-mass rule for alternatives.
+
 Each successful JSONL row retains the exact response text in
-`raw_response_text`, the parsed response in `raw_model_output`, and the
-validated, sorted markers in `annotations`. It also records model metadata,
-token usage, attempts, elapsed time, and a convenience `tagged_text` rendering.
+`raw_response_text`, the model's thought summary in `thought_summary`, the
+parsed response in `raw_model_output`, and the validated, sorted markers in
+`annotations`. It also records model metadata, token usage, attempts, elapsed
+time, and a convenience `tagged_text` rendering such as
+`[tired][sigh]我们的合作课题，几天下来都没什么进展。`.
+
+The report summarises token usage (prompt, cached prompt, output, and thought
+tokens) with a cost estimate that applies the cached-input discount and
+approximate cache storage, marker counts, per-label counts, confidence histograms, and how
+many markers carry alternatives.
 
 ## Security and data handling
 
