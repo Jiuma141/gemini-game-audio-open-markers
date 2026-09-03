@@ -10,7 +10,6 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).parent
-OUT = ROOT / "results" / "review-v15-200.html"
 MP3_CACHE = ROOT / "inputs" / "cache" / "mp3"
 
 
@@ -75,8 +74,11 @@ def usage(row: dict) -> tuple[int, int, int, int]:
     )
 
 
-def cost(prompt: int, thoughts: int, out: int, cached: int = 0) -> float:
-    return (prompt - cached) * 0.75e-6 + cached * 0.075e-6 + (thoughts + out) * 3.75e-6
+def cost(prompt: int, thoughts: int, out: int, cached: int = 0, batch: bool = False) -> float:
+    # Batch halves uncached input and output; cached tokens keep their own discount.
+    factor = 0.5 if batch else 1.0
+    return ((prompt - cached) * 0.75e-6 * factor + cached * 0.075e-6
+            + (thoughts + out) * 3.75e-6 * factor)
 
 
 def stage1_html(markers: list[dict]) -> str:
@@ -92,25 +94,81 @@ def stage1_html(markers: list[dict]) -> str:
     return " ".join(parts)
 
 
+FLAGGED = {18, 19, 20, 25, 26, 34, 42, 74, 75, 76, 79, 88, 91, 102, 109, 111, 114, 120, 125,
+           127, 129, 136, 144, 145, 157, 159, 180, 187, 189, 190}
+# The 50-item review set: the 30 human-flagged cards plus 20 fixed random ones.
+REVIEW50 = sorted(FLAGGED | {5, 38, 41, 47, 62, 66, 67, 70, 81, 99, 103, 122, 124, 135, 142,
+                             148, 154, 156, 194, 195})
+
+PRESETS = {
+    "38-medium-vs-low": {
+        "out": "review-v17-38-medium-vs-low-50.html",
+        "title": "v17 · 3.8 · MEDIUM vs LOW（50 条）",
+        "h1": "v17 · Gemini 3.8 Flash：MEDIUM vs LOW thinking（50 条 = 30 条人工反馈 + 20 条随机）",
+        "blurb": "MEDIUM 一行取自 v17·3.8 的 200 条 batch 运行，LOW 一行是同一提示词、同一模型、thinking=LOW 单独跑的 50 条。",
+        "runs": [("v17 · 3.8 · MEDIUM", "pilot200-v17-38.jsonl", "vlatest"),
+                 ("v17 · 3.8 · LOW", "pilot50-v17-38-low.jsonl", "medium")],
+        "cards": REVIEW50,
+    },
+    "37-medium-50": {
+        "out": "review-v17-37-medium-50.html",
+        "title": "v17 · 3.7 · MEDIUM（50 条）",
+        "h1": "v17 · Gemini 3.7 Flash · MEDIUM thinking（50 条 = 30 条人工反馈 + 20 条随机）",
+        "blurb": "取自 v17·3.7 的 200 条 batch 运行，条目与 3.8 的 50 条对比页完全相同。",
+        "runs": [("v17 · 3.7 · MEDIUM", "pilot200-v17-37.jsonl", "twostage")],
+        "cards": REVIEW50,
+    },
+}
+
+
 def main() -> None:
-    runs = {
-        "v15": read_jsonl(ROOT / "results" / "pilot200-v15.jsonl"),
-    }
-    css_class = {"v15": "vlatest"}
-    manifest = {row["id"]: row for row in map(json.loads, (ROOT / "inputs" / "manifest.jsonl").open(encoding="utf-8"))}
-    ids = [row_id for row_id in manifest if all(row_id in rows for rows in runs.values())]
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("preset", choices=sorted(PRESETS), nargs="?", default="38-medium-vs-low")
+    preset = PRESETS[parser.parse_args().preset]
+    out = ROOT / "results" / preset["out"]
+
+    # Card numbers follow the manifest position so they match the 200-item review.
+    manifest_rows = [json.loads(line) for line in (ROOT / "inputs" / "manifest.jsonl").open(encoding="utf-8")]
+    manifest = {row["id"]: row for row in manifest_rows}
+    position_of = {row["id"]: index for index, row in enumerate(manifest_rows, start=1)}
+    wanted = set(preset["cards"]) if preset["cards"] else None
+    ids = [row["id"] for row in manifest_rows if wanted is None or position_of[row["id"]] in wanted]
+
+    runs: dict[str, dict[str, dict]] = {}
+    all_rows: dict[str, dict[str, dict]] = {}
+    css_class: dict[str, str] = {}
+    for name, filename, css in preset["runs"]:
+        path = ROOT / "results" / filename
+        all_rows[name] = {row["id"]: row for row in map(json.loads, path.open(encoding="utf-8"))}
+        runs[name] = {k: v for k, v in read_jsonl(path).items() if k in ids}
+        css_class[name] = css
+    flagged = FLAGGED
 
     totals = {name: [0, 0, 0, 0] for name in runs}
+    run_cost = {name: 0.0 for name in runs}
     cards: list[str] = []
-    for position, row_id in enumerate(ids, start=1):
+    for row_id in ids:
+        position = position_of[row_id]
         audio_src = audio_data_uri(ROOT / "inputs" / manifest[row_id]["audio"])
-        first = next(iter(runs.values()))[row_id]
+        first = next(rows[row_id] for rows in runs.values() if row_id in rows)
         rows_html = ""
         for name, rows in runs.items():
-            row = rows[row_id]
+            row = rows.get(row_id)
+            if row is None:
+                failed = all_rows[name].get(row_id) or {}
+                reason = html.escape(str((failed.get("error") or {}).get("message", "no result"))[:200])
+                rows_html += f"""
+            <div class="run">
+              <div class="runhead"><span class="level {css_class[name]}">{name}</span>
+                <span class="tok">失败（{failed.get("attempts", "?")} 次尝试）: {reason}</span></div>
+            </div>"""
+                continue
             use = usage(row)
             for i in range(4):
                 totals[name][i] += use[i]
+            run_cost[name] += cost(*use, batch=row.get("transport") == "batch")
             stage1_block = ""
             if row.get("stage1_markers"):
                 stage1_block = (
@@ -125,8 +183,8 @@ def main() -> None:
                 )
             rows_html += f"""
             <div class="run">
-              <div class="runhead"><span class="level {css_class[name]}">MEDIUM {name}</span>
-                <span class="tok">prompt {use[0]:,}{f" (缓存 {use[3]:,})" if use[3] else ""} · 思考 {use[1]:,} · 输出 {use[2]:,} tok · ${cost(*use):.4f}</span></div>
+              <div class="runhead"><span class="level {css_class[name]}">{name}</span>
+                <span class="tok">{"batch · " if row.get("transport") == "batch" else ""}prompt {use[0]:,}{f" (缓存 {use[3]:,})" if use[3] else ""} · 思考 {use[1]:,} · 输出 {use[2]:,} tok · ${cost(*use, batch=row.get("transport") == "batch"):.4f}</span></div>
               {stage1_block}
               <div class="tagged">{tagged_html(row["official_transcript"], row["annotations"])}</div>
               {thought_block}
@@ -135,6 +193,7 @@ def main() -> None:
         <div class="card">
           <div class="cardhead">
             <span class="idx">#{position}</span>
+            {'<span class="flag">人工反馈</span>' if position in flagged else ''}
             <span class="lang">{html.escape(str(manifest[row_id]["language"]))}</span>
             <code class="rid">{html.escape(row_id)}</code>
             <span class="dur">wer/cer {manifest[row_id]["asr_error_rate"]:.2f} · {first["duration"]:.1f}s</span>
@@ -148,13 +207,13 @@ def main() -> None:
         p, t, o, c = totals[name]
         cached = f"（其中缓存 {c:,}）" if c else ""
         return (f"prompt {p:,}{cached} · 思考 {t:,} · 输出 {o:,} · 合计 {p + t + o:,} tok · "
-                f"${cost(p, t, o, c):.4f}")
+                f"${run_cost[name]:.4f}")
 
     page = f"""<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>v15 标注（200 条）</title>
+<title>{html.escape(preset["title"])}</title>
 <style>
   :root {{ color-scheme: light; }}
   body {{ font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
@@ -162,12 +221,14 @@ def main() -> None:
   header {{ background: #fff; border-bottom: 1px solid #e3e5e8; padding: 20px 28px; }}
   h1 {{ font-size: 20px; margin: 0 0 10px; }}
   .summary {{ font-size: 13px; color: #444; line-height: 1.8; }}
-  .summary b {{ display: inline-block; width: 68px; }}
+  .summary b {{ display: inline-block; width: 160px; }}
   main {{ max-width: 980px; margin: 24px auto; padding: 0 16px; }}
   .card {{ background: #fff; border: 1px solid #e3e5e8; border-radius: 10px;
           padding: 16px 20px; margin-bottom: 18px; }}
   .cardhead {{ display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }}
   .idx {{ font-weight: 700; color: #555; }}
+  .flag {{ font-size: 11px; font-weight: 700; background: #fde8e8; color: #b42318;
+          padding: 2px 7px; border-radius: 999px; }}
   .lang {{ font-size: 11px; font-weight: 700; text-transform: uppercase; background: #eef1f4;
           color: #556; padding: 2px 7px; border-radius: 999px; }}
   .rid {{ font-size: 11px; color: #888; overflow-wrap: anywhere; }}
@@ -200,11 +261,12 @@ def main() -> None:
 </head>
 <body>
 <header>
-  <h1>v15 标注（全部 200 条，前 100 条与此前 pilot 相同，MEDIUM thinking）</h1>
+  <h1>{html.escape(preset["h1"])}</h1>
   <div class="summary">
-    <div><b>v15</b>{fmt_total("v15")}</div>
-    <div style="margin-top:6px">闭集词表 + 置信度校准 + 备选标签（虚线框，主标签与备选置信度总和 ≤ 1）+ 括号等脚本约定不作为声学证据 + 不切词。
-      每张卡片底部可展开思考摘要。
+    {"".join(f'<div><b>{html.escape(name)}</b>{fmt_total(name)}</div>' for name in runs)}
+    <div style="margin-top:6px">卡片编号沿用 200 条评测页的编号；红色"人工反馈"标记的是你在 v15 评测里指出问题的 30 条。
+      {html.escape(preset["blurb"])}
+      v17 = 去掉 inhale/exhale 事件标签 + 态度类标签需要可听的语调证据 + 笑声等事件必须真实可闻。每张卡片底部可展开思考摘要。
       标签内的小数字是 confidence；悬停可看 placement_confidence。
       <span class="tag emotion">情绪<span class="conf">0.92</span></span>
       <span class="tag event">事件<span class="conf">0.88</span></span></div>
@@ -213,8 +275,8 @@ def main() -> None:
 <main>{"".join(cards)}</main>
 </body>
 </html>"""
-    OUT.write_text(page, encoding="utf-8")
-    print(f"wrote {OUT} ({OUT.stat().st_size / 1e6:.1f} MB, {len(ids)} items)")
+    out.write_text(page, encoding="utf-8")
+    print(f"wrote {out} ({out.stat().st_size / 1e6:.1f} MB, {len(ids)} items)")
 
 
 if __name__ == "__main__":

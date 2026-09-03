@@ -22,20 +22,27 @@ from pathlib import Path
 from typing import Any
 
 
-MODEL = "gemini-3.7-flash"
-PROMPT_VERSION = "game-audio-closed-marker-sequence-v15"
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
+PROMPT_VERSION = "game-audio-closed-marker-sequence-v17"
 THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "MEDIUM")
 TEMPERATURE = 0.0
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
+UPLOAD_ROOT = "https://generativelanguage.googleapis.com/upload/v1beta"
+DOWNLOAD_ROOT = "https://generativelanguage.googleapis.com/download/v1beta"
 # Explicit context cache holding BASE_PROMPT; every request then only sends the
-# per-clip INPUT block and the audio. Storage is billed per token-hour, so keep
-# the TTL close to the expected run length.
-CACHE_TTL_SECONDS = int(os.environ.get("GEMINI_CACHE_TTL_SECONDS", "7200"))
+# per-clip INPUT block and the audio. Storage is billed per token-hour. Sync
+# runs finish in minutes; batch jobs may take up to 24h, so their cache must
+# outlive the job's turnaround SLO.
+CACHE_TTL_SECONDS_SYNC = int(os.environ.get("GEMINI_CACHE_TTL_SECONDS", "7200"))
+CACHE_TTL_SECONDS_BATCH = int(os.environ.get("GEMINI_CACHE_TTL_SECONDS", str(30 * 3600)))
 # Pricing assumptions (USD per token) used for the report's cost estimate.
 PRICE_INPUT = 0.75e-6
 PRICE_CACHED_INPUT = 0.075e-6
 PRICE_OUTPUT = 3.75e-6
 PRICE_CACHE_STORAGE_PER_TOKEN_HOUR = 1.0e-6
+# Batch API bills uncached input and output at half price; cached tokens keep
+# the (larger) caching discount instead of stacking.
+BATCH_DISCOUNT = 0.5
 
 # Closed label vocabulary: the "english" column of tts_bracket_emotion_enword_180d.csv,
 # split into emotion/delivery-state labels and paralinguistic-event labels.
@@ -59,7 +66,7 @@ EMOTION_LABELS = (
 EVENT_LABELS = (
     "pause", "moaning", "laugh", "crying", "sigh", "giggle", "chuckles",
     "panting", "gasp", "cough", "clear_throat", "groan", "whimpering",
-    "grunt", "yawn", "stutter", "sniffles", "growl", "inhale", "exhale",
+    "grunt", "yawn", "stutter", "sniffles", "growl",
 )
 LABEL_SETS = {"emotion": frozenset(EMOTION_LABELS), "event": frozenset(EVENT_LABELS)}
 MAX_ALTERNATIVES = 3
@@ -84,6 +91,7 @@ Do not let the text bias you:
 Emotion markers:
 - Emotion labels cover both emotions (e.g. happy, angry, nervous) and audible vocal-delivery states (e.g. whisper, shouting, breathy, soft).
 - Choose the label that best matches the audibly dominant emotion or delivery. If delivery is plain and no clear emotion is audible, use "neutral".
+- Attitude labels (e.g. sarcastic, mocking, teasing, playful, smug, threatening, evil, skeptical, flirty) require the attitude to be audible in the voice itself: exaggerated or sing-song intonation, drawn-out syllables, a sneer or laugh in the voice, menacing low pitch, and so on. Words alone never justify them. Test: if the same voice read unrelated neutral words, would you still hear that attitude? If not, label the plain delivery you actually hear (serious, calm, neutral, polite, surprised, hesitant, disappointed…) even when the sentence itself is sarcastic, threatening, or doubtful.
 - The first emotion marker must have insert_char_index 0.
 - An emotion marker starts a state that continues until the next emotion marker or the end of the utterance.
 - Add another emotion marker only when the dominant audible emotion or delivery clearly changes. Do not split merely because a new clause begins, and do not repeat consecutive identical labels.
@@ -92,6 +100,8 @@ Emotion markers:
 Event markers:
 - Detect only clearly audible human vocal or respiratory paralinguistic events. Do not label ordinary speech, inaudible/ordinary breathing, background music, ambience, or non-human sound effects.
 - "pause" is ONLY for a long, deliberate silent gap in speech of roughly 0.5 seconds or more. Short beats between words or clauses, ordinary breaths, and brief gaps at punctuation are NOT pauses. Punctuation is not evidence: commas, periods, ellipses, and dashes often carry no audible pause, and real pauses can occur mid-clause without punctuation. When unsure whether a gap is long enough, omit the pause marker.
+- Breathing: plain breaths (inhales or exhales between phrases, before speaking, or at the end) are NOT events and have no label; leave them unmarked. Only expressive breathing counts, and only when it is unmistakable: "sigh" is a long, expressive (often voiced) exhale; "panting" is repeated rapid breathing; "gasp" is a sudden sharp intake caused by shock or fear. Sustained breathy delivery is the emotion label "breathy", not an event.
+- Vocal events such as laugh, chuckles, giggle, grunt, groan, and whimpering must likewise be audible as sounds in their own right. Do not add them because the wording is funny, angry, or frightened.
 - If a real event has no close match in ALLOWED_EVENT_LABELS, omit that event rather than forcing a wrong label.
 - Place each event marker at the transcript boundary where the event is heard; events may repeat wherever they actually occur.
 - confidence is the probability that the event exists AND its label is correct; placement_confidence follows the calibration rules below.
@@ -289,12 +299,18 @@ class PromptCache:
     prompt instead.
     """
 
-    def __init__(self, enabled: bool):
+    def __init__(self, enabled: bool, ttl_seconds: int = CACHE_TTL_SECONDS_SYNC):
         self.enabled = enabled
+        self.ttl_seconds = ttl_seconds
         self._name: str | None = None
         self._lock = threading.Lock()
         self.created_tokens = 0
         self.creations = 0
+
+    def adopt(self, name: str) -> None:
+        """Reuse a cache created by an earlier (interrupted) run."""
+        with self._lock:
+            self._name = name
 
     def name(self) -> str | None:
         if not self.enabled:
@@ -309,14 +325,14 @@ class PromptCache:
             "model": f"models/{MODEL}",
             "displayName": f"{PROMPT_VERSION}-{config_hash()}",
             "contents": [{"role": "user", "parts": [{"text": BASE_PROMPT}]}],
-            "ttl": f"{CACHE_TTL_SECONDS}s",
+            "ttl": f"{self.ttl_seconds}s",
         })
         self.created_tokens = int((response.get("usageMetadata") or {}).get("totalTokenCount") or 0)
         self.creations += 1
         print(json.dumps({
             "cache_created": response["name"],
             "cached_tokens": self.created_tokens,
-            "ttl_seconds": CACHE_TTL_SECONDS,
+            "ttl_seconds": self.ttl_seconds,
         }), flush=True)
         return str(response["name"])
 
@@ -471,9 +487,18 @@ def render_text(transcript: str, annotations: list[dict[str, Any]]) -> str:
     return "".join(parts)
 
 
-def call_model(
-    audio_bytes: bytes, mime_type: str, row: dict[str, Any], schema: dict[str, Any]
-) -> tuple[dict[str, Any], str, str]:
+def load_audio(row: dict[str, Any]) -> tuple[bytes, str]:
+    audio_path = Path(row["audio_path_local"])
+    mime_type = str(
+        row.get("mime_type") or mimetypes.guess_type(audio_path.name)[0] or "audio/flac"
+    )
+    return audio_path.read_bytes(), mime_type
+
+
+def build_request(
+    row: dict[str, Any], audio_bytes: bytes, mime_type: str, cache_name: str | None
+) -> dict[str, Any]:
+    """GenerateContentRequest body shared by the sync and batch transports."""
     audio_part = {
         "inlineData": {
             "mimeType": mime_type,
@@ -483,34 +508,29 @@ def call_model(
     generation_config = {
         "temperature": TEMPERATURE,
         "responseMimeType": "application/json",
-        "responseJsonSchema": schema,
+        "responseJsonSchema": response_schema(),
         "thinkingConfig": {
             "thinkingLevel": THINKING_LEVEL,
             "includeThoughts": True,
         },
     }
-    cache_name = PROMPT_CACHE.name()
     if cache_name is None:
         # Text first so requests share an identical prefix for implicit caching.
-        body: dict[str, Any] = {
+        return {
             "contents": [{"role": "user", "parts": [{"text": build_prompt(row)}, audio_part]}],
             "generationConfig": generation_config,
         }
-    else:
-        # BASE_PROMPT comes from the cache as the prompt prefix; only the
-        # per-clip INPUT block and audio travel with the request.
-        body = {
-            "cachedContent": cache_name,
-            "contents": [{"role": "user", "parts": [{"text": build_input_block(row)}, audio_part]}],
-            "generationConfig": generation_config,
-        }
-    try:
-        api_response = post_gemini(body)
-    except GeminiHTTPError as exc:
-        if cache_name is not None and cache_missing(exc):
-            PROMPT_CACHE.invalidate(cache_name)
-            return call_model(audio_bytes, mime_type, row, schema)
-        raise
+    # BASE_PROMPT comes from the cache as the prompt prefix; only the per-clip
+    # INPUT block and audio travel with the request.
+    return {
+        "cachedContent": cache_name,
+        "contents": [{"role": "user", "parts": [{"text": build_input_block(row)}, audio_part]}],
+        "generationConfig": generation_config,
+    }
+
+
+def split_response(api_response: dict[str, Any]) -> tuple[str, str]:
+    """Return (raw JSON text, thought summary) from a GenerateContentResponse."""
     candidates = api_response.get("candidates") or []
     if not candidates:
         raise ValueError(f"response has no candidates: {api_response}")
@@ -523,6 +543,21 @@ def call_model(
     )
     if not raw_response_text:
         raise ValueError(f"response has no JSON text: {api_response}")
+    return raw_response_text, thought_summary
+
+
+def call_model(
+    audio_bytes: bytes, mime_type: str, row: dict[str, Any]
+) -> tuple[dict[str, Any], str, str]:
+    cache_name = PROMPT_CACHE.name()
+    try:
+        api_response = post_gemini(build_request(row, audio_bytes, mime_type, cache_name))
+    except GeminiHTTPError as exc:
+        if cache_name is not None and cache_missing(exc):
+            PROMPT_CACHE.invalidate(cache_name)
+            return call_model(audio_bytes, mime_type, row)
+        raise
+    raw_response_text, thought_summary = split_response(api_response)
     return api_response, raw_response_text, thought_summary
 
 
@@ -539,9 +574,8 @@ def retryable(exc: Exception) -> bool:
     )
 
 
-def infer(row: dict[str, Any], max_attempts: int) -> dict[str, Any]:
-    started = time.monotonic()
-    wrapper: dict[str, Any] = {
+def new_wrapper(row: dict[str, Any]) -> dict[str, Any]:
+    return {
         "schema_version": "game_audio_open_marker_result_v2",
         "id": str(row["id"]),
         "dataset": "Genshin",
@@ -557,46 +591,66 @@ def infer(row: dict[str, Any], max_attempts: int) -> dict[str, Any]:
         "temperature": TEMPERATURE,
         "status": "error",
     }
-    audio_path = Path(row["audio_path_local"])
-    audio_bytes = audio_path.read_bytes()
-    mime_type = str(
-        row.get("mime_type") or mimetypes.guess_type(audio_path.name)[0] or "audio/flac"
-    )
-    history = []
-    for attempt in range(1, max_attempts + 1):
+
+
+def accept_response(
+    wrapper: dict[str, Any], row: dict[str, Any], api_response: dict[str, Any], transport: str
+) -> None:
+    """Validate a model response and record it on the wrapper; raises if invalid."""
+    raw_response_text, thought_summary = split_response(api_response)
+    payload = json.loads(raw_response_text)
+    annotations = validate_payload(payload, row["text"])
+    candidates = api_response.get("candidates") or []
+    wrapper.update({
+        "status": "ok",
+        "transport": transport,
+        "raw_response_text": raw_response_text,
+        "thought_summary": thought_summary or None,
+        "raw_model_output": payload,
+        "annotations": annotations,
+        "tagged_text": render_text(row["text"], annotations),
+        "usage_metadata": api_response.get("usageMetadata"),
+        "context_cache": PROMPT_CACHE.enabled,
+        "response_id": api_response.get("responseId"),
+        "api_model_version": api_response.get("modelVersion"),
+        "finish_reason": candidates[0].get("finishReason"),
+        "completed_at_unix": time.time(),
+    })
+
+
+def infer(
+    row: dict[str, Any], max_attempts: int, history: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """Annotate one row over the synchronous API with retries.
+
+    `history` carries earlier failed attempts (e.g. from a batch job) so the
+    result records the full story.
+    """
+    started = time.monotonic()
+    wrapper = new_wrapper(row)
+    audio_bytes, mime_type = load_audio(row)
+    history = list(history or [])
+    first_attempt = len(history) + 1
+    for attempt in range(first_attempt, first_attempt + max_attempts):
         try:
-            api_response, raw_response_text, thought_summary = call_model(
-                audio_bytes, mime_type, row, response_schema()
-            )
-            payload = json.loads(raw_response_text)
-            annotations = validate_payload(payload, row["text"])
-            candidates = api_response.get("candidates") or []
+            api_response, _, _ = call_model(audio_bytes, mime_type, row)
+            accept_response(wrapper, row, api_response, "sync")
             wrapper.update({
-                "status": "ok",
-                "raw_response_text": raw_response_text,
-                "thought_summary": thought_summary or None,
-                "raw_model_output": payload,
-                "annotations": annotations,
-                "tagged_text": render_text(row["text"], annotations),
-                "usage_metadata": api_response.get("usageMetadata"),
-                "context_cache": PROMPT_CACHE.enabled,
-                "response_id": api_response.get("responseId"),
-                "api_model_version": api_response.get("modelVersion"),
-                "finish_reason": candidates[0].get("finishReason"),
                 "attempts": attempt,
+                "attempt_history": history or None,
                 "elapsed_seconds": time.monotonic() - started,
-                "completed_at_unix": time.time(),
             })
             return wrapper
         except Exception as exc:
             history.append({
                 "attempt": attempt,
+                "transport": "sync",
                 "type": type(exc).__name__,
                 "message": str(exc)[:2000],
             })
-            if attempt >= max_attempts or not retryable(exc):
+            if attempt >= first_attempt + max_attempts - 1 or not retryable(exc):
                 break
-            time.sleep(min(30.0, 2 ** (attempt - 1) + random.random()))
+            time.sleep(min(30.0, 2 ** (attempt - first_attempt) + random.random()))
     wrapper.update({
         "attempts": len(history),
         "attempt_history": history,
@@ -606,6 +660,212 @@ def infer(row: dict[str, Any], max_attempts: int) -> dict[str, Any]:
         "completed_at_unix": time.time(),
     })
     return wrapper
+
+
+def upload_file(data: bytes, mime_type: str, display_name: str) -> str:
+    """Upload bytes through the File API (resumable, single chunk); returns files/…"""
+    key = os.environ["GEMINI_API_KEY"]
+    start = urllib.request.Request(
+        f"{UPLOAD_ROOT}/files",
+        data=json.dumps({"file": {"display_name": display_name}}).encode("utf-8"),
+        headers={
+            "x-goog-api-key": key,
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": str(len(data)),
+            "X-Goog-Upload-Header-Content-Type": mime_type,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(start, timeout=120) as response:
+            upload_url = response.headers.get("X-Goog-Upload-URL")
+    except urllib.error.HTTPError as exc:
+        raise GeminiHTTPError(exc.code, exc.read().decode("utf-8", errors="replace")) from exc
+    if not upload_url:
+        raise RuntimeError("file upload start did not return X-Goog-Upload-URL")
+    finish = urllib.request.Request(
+        upload_url,
+        data=data,
+        headers={
+            "Content-Length": str(len(data)),
+            "X-Goog-Upload-Offset": "0",
+            "X-Goog-Upload-Command": "upload, finalize",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(finish, timeout=1800) as response:
+            info = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise GeminiHTTPError(exc.code, exc.read().decode("utf-8", errors="replace")) from exc
+    return str(info["file"]["name"])
+
+
+def download_file(file_name: str) -> bytes:
+    request = urllib.request.Request(
+        f"{DOWNLOAD_ROOT}/{file_name}:download?alt=media",
+        headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=1800) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        raise GeminiHTTPError(exc.code, exc.read().decode("utf-8", errors="replace")) from exc
+
+
+def batch_state_path(output: Path) -> Path:
+    return output.with_suffix(output.suffix + ".batch.json")
+
+
+def submit_batch(pending: list[dict[str, Any]], output: Path) -> dict[str, Any]:
+    """Upload one request per pending row and start a batch job; persist its state."""
+    cache_name = PROMPT_CACHE.name()
+    lines = []
+    for row in pending:
+        audio_bytes, mime_type = load_audio(row)
+        lines.append(json.dumps({
+            "key": str(row["id"]),
+            "request": build_request(row, audio_bytes, mime_type, cache_name),
+        }, ensure_ascii=False, separators=(",", ":")))
+    data = ("\n".join(lines) + "\n").encode("utf-8")
+    display_name = f"{PROMPT_VERSION}-{config_hash()}-{int(time.time())}"
+    file_name = upload_file(data, "application/jsonl", display_name)
+    print(json.dumps({
+        "batch_input_uploaded": file_name, "requests": len(pending),
+        "bytes": len(data),
+    }), flush=True)
+    operation = gemini_request("POST", f"models/{MODEL}:batchGenerateContent", {
+        "batch": {"display_name": display_name, "input_config": {"file_name": file_name}},
+    })
+    state = {
+        "job": operation["name"],
+        "config_hash": config_hash(),
+        "cache_name": cache_name,
+        "input_file": file_name,
+        "ids": [str(row["id"]) for row in pending],
+        "submitted_at_unix": time.time(),
+    }
+    batch_state_path(output).write_text(json.dumps(state, indent=2), encoding="utf-8")
+    print(json.dumps({"batch_submitted": operation["name"], "requests": len(pending)}), flush=True)
+    return state
+
+
+def load_batch_state(output: Path, pending_ids: set[str]) -> dict[str, Any] | None:
+    """Return a saved, still-relevant batch job for this output, if any."""
+    path = batch_state_path(output)
+    if not path.is_file():
+        return None
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if state.get("config_hash") != config_hash() or not (set(state.get("ids", [])) & pending_ids):
+        path.unlink()
+        return None
+    return state
+
+
+def batch_state_name(operation: dict[str, Any]) -> str:
+    """Normalise BATCH_STATE_* / JOB_STATE_* to the bare suffix, e.g. SUCCEEDED."""
+    state = str((operation.get("metadata") or {}).get("state") or "")
+    return state.rsplit("_", 1)[-1]
+
+
+def wait_for_batch(job: str, poll_seconds: float) -> dict[str, Any]:
+    terminal = {"SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}
+    last_seen = None
+    while True:
+        operation = gemini_request("GET", job)
+        metadata = operation.get("metadata") or {}
+        stats = metadata.get("batchStats") or {}
+        seen = json.dumps({"batch_state": metadata.get("state"), "batch_stats": stats}, sort_keys=True)
+        if seen != last_seen:
+            print(seen, flush=True)
+            last_seen = seen
+        if operation.get("done") or batch_state_name(operation) in terminal:
+            return operation
+        time.sleep(poll_seconds)
+
+
+def batch_results(operation: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Map request key -> {'response': …} or {'error': …} from a finished job."""
+    response = operation.get("response") or {}
+    if response.get("inlinedResponses"):
+        items = response["inlinedResponses"]
+    elif response.get("responsesFile"):
+        raw = download_file(str(response["responsesFile"])).decode("utf-8")
+        items = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    else:
+        raise RuntimeError(f"batch job finished without results: {operation}")
+    results: dict[str, dict[str, Any]] = {}
+    for item in items:
+        key = str(item.get("key") or (item.get("metadata") or {}).get("key") or "")
+        results[key] = item
+    return results
+
+
+def run_batch(
+    args: argparse.Namespace, pending: list[dict[str, Any]], handle: Any
+) -> tuple[int, int]:
+    """Annotate pending rows through the Batch API; fall back to sync for failures."""
+    by_id = {str(row["id"]): row for row in pending}
+    state = load_batch_state(args.output, set(by_id))
+    if state is None:
+        state = submit_batch(pending, args.output)
+    else:
+        print(json.dumps({"batch_resumed": state["job"], "requests": len(state["ids"])}), flush=True)
+        if state.get("cache_name"):
+            PROMPT_CACHE.adopt(state["cache_name"])
+    operation = wait_for_batch(state["job"], args.batch_poll_seconds)
+    if batch_state_name(operation) != "SUCCEEDED":
+        # Nothing to collect; drop the state so a rerun submits a fresh job.
+        batch_state_path(args.output).unlink(missing_ok=True)
+        raise RuntimeError(
+            f"batch job {state['job']} ended in "
+            f"{(operation.get('metadata') or {}).get('state')}: {operation.get('error')}"
+        )
+    results = batch_results(operation)
+
+    ok = errors = 0
+    fallback: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    for row_id in state["ids"]:
+        row = by_id.get(row_id)
+        if row is None:  # already completed by an earlier run
+            continue
+        item = results.get(row_id)
+        failure: dict[str, Any] | None = None
+        if item is None:
+            failure = {"type": "MissingBatchResult", "message": "no result for key"}
+        elif item.get("error"):
+            failure = {"type": "BatchError", "message": json.dumps(item["error"])[:2000]}
+        else:
+            wrapper = new_wrapper(row)
+            try:
+                accept_response(wrapper, row, item["response"], "batch")
+                wrapper.update({"attempts": 1, "batch_job": state["job"], "elapsed_seconds": None})
+                handle.write(json.dumps(wrapper, ensure_ascii=False, separators=(",", ":")) + "\n")
+                ok += 1
+                continue
+            except Exception as exc:
+                failure = {"type": type(exc).__name__, "message": str(exc)[:2000]}
+        failure.update({"attempt": 1, "transport": "batch", "batch_job": state["job"]})
+        fallback.append((row, [failure]))
+    handle.flush()
+    print(json.dumps({"batch_ok": ok, "batch_fallback_to_sync": len(fallback)}), flush=True)
+
+    if fallback:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(infer, row, args.max_attempts, history) for row, history in fallback]
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                handle.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n")
+                handle.flush()
+                if result["status"] == "ok":
+                    ok += 1
+                else:
+                    errors += 1
+                print(json.dumps({"sync_fallback": result["id"], "status": result["status"]}), flush=True)
+    batch_state_path(args.output).unlink(missing_ok=True)
+    return ok, errors
 
 
 def read_completed(path: Path) -> set[str]:
@@ -624,7 +884,9 @@ def confidence_histogram(markers: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def write_report(output: Path, report_path: Path, total_rows: int) -> None:
+def write_report(
+    output: Path, report_path: Path, total_rows: int, cache_started_unix: float | None = None
+) -> None:
     rows = read_jsonl(output) if output.exists() else []
     current = [row for row in rows if row.get("config_hash") == config_hash()]
     by_id = {str(row["id"]): row for row in current}
@@ -632,19 +894,31 @@ def write_report(output: Path, report_path: Path, total_rows: int) -> None:
     ok = [row for row in final_rows if row.get("status") == "ok"]
     errors = [row for row in final_rows if row.get("status") != "ok"]
     prompt_tokens = cached_tokens = candidate_tokens = thought_tokens = total_tokens = 0
+    token_cost = 0.0
+    transports: Counter[str] = Counter()
     for row in ok:
         usage = row.get("usage_metadata") or {}
-        prompt_tokens += int(usage.get("prompt_token_count") or usage.get("promptTokenCount") or 0)
-        cached_tokens += int(
+        prompt = int(usage.get("prompt_token_count") or usage.get("promptTokenCount") or 0)
+        cached = int(
             usage.get("cached_content_token_count") or usage.get("cachedContentTokenCount") or 0
         )
-        candidate_tokens += int(
+        candidates = int(
             usage.get("candidates_token_count") or usage.get("candidatesTokenCount") or 0
         )
-        thought_tokens += int(
-            usage.get("thoughts_token_count") or usage.get("thoughtsTokenCount") or 0
-        )
+        thoughts = int(usage.get("thoughts_token_count") or usage.get("thoughtsTokenCount") or 0)
+        prompt_tokens += prompt
+        cached_tokens += cached
+        candidate_tokens += candidates
+        thought_tokens += thoughts
         total_tokens += int(usage.get("total_token_count") or usage.get("totalTokenCount") or 0)
+        transport = str(row.get("transport") or "sync")
+        transports[transport] += 1
+        discount = BATCH_DISCOUNT if transport == "batch" else 1.0
+        token_cost += (
+            (prompt - cached) * PRICE_INPUT * discount
+            + cached * PRICE_CACHED_INPUT
+            + (candidates + thoughts) * PRICE_OUTPUT * discount
+        )
     emotions = [
         marker
         for row in ok
@@ -658,20 +932,17 @@ def write_report(output: Path, report_path: Path, total_rows: int) -> None:
         if marker["type"] == "event"
     ]
     # promptTokenCount includes the cached prefix; only the remainder is billed
-    # at the full input rate. Cache storage is approximated by the run's span.
+    # at the full input rate. Cache storage is approximated by the run's span
+    # (batch jobs: from submission to collection).
     cache_hours = 0.0
     if cached_tokens and ok:
         stamps = [float(row.get("completed_at_unix") or 0) for row in ok]
+        stamps.append(float(cache_started_unix or stamps[0]))
         cache_hours = max(max(stamps) - min(stamps), 60.0) / 3600
     cache_storage_cost = (
         PROMPT_CACHE.created_tokens or (cached_tokens // len(ok) if ok else 0)
     ) * cache_hours * PRICE_CACHE_STORAGE_PER_TOKEN_HOUR
-    estimated_standard_cost = (
-        (prompt_tokens - cached_tokens) * PRICE_INPUT
-        + cached_tokens * PRICE_CACHED_INPUT
-        + (candidate_tokens + thought_tokens) * PRICE_OUTPUT
-        + cache_storage_cost
-    )
+    estimated_standard_cost = token_cost + cache_storage_cost
     report = {
         "schema_version": "game_audio_open_marker_report_v1",
         "model": MODEL,
@@ -683,6 +954,7 @@ def write_report(output: Path, report_path: Path, total_rows: int) -> None:
         "result_rows": len(final_rows),
         "successful_rows": len(ok),
         "error_rows": len(errors),
+        "rows_by_transport": dict(transports),
         "prompt_tokens": prompt_tokens,
         "cached_prompt_tokens": cached_tokens,
         "candidate_tokens": candidate_tokens,
@@ -695,6 +967,7 @@ def write_report(output: Path, report_path: Path, total_rows: int) -> None:
             "cached_input": PRICE_CACHED_INPUT * 1e6,
             "output_and_thoughts": PRICE_OUTPUT * 1e6,
             "cache_storage_per_hour": PRICE_CACHE_STORAGE_PER_TOKEN_HOUR * 1e6,
+            "batch_multiplier_on_uncached": BATCH_DISCOUNT,
         },
         "emotion_markers": len(emotions),
         "event_markers": len(events),
@@ -739,8 +1012,12 @@ def main() -> None:
     parser.add_argument("--ids", help="comma-separated id substrings; keep only matching rows")
     parser.add_argument("--no-cache", action="store_true",
                         help="send the full prompt with every request instead of an explicit context cache")
+    parser.add_argument("--sync", action="store_true",
+                        help="call generateContent directly instead of submitting a Batch API job")
+    parser.add_argument("--batch-poll-seconds", type=float, default=30.0)
     args = parser.parse_args()
     PROMPT_CACHE.enabled = not args.no_cache
+    PROMPT_CACHE.ttl_seconds = CACHE_TTL_SECONDS_SYNC if args.sync else CACHE_TTL_SECONDS_BATCH
 
     if not os.environ.get("GEMINI_API_KEY"):
         os.environ["GEMINI_API_KEY"] = getpass.getpass("Gemini API key: ")
@@ -769,34 +1046,50 @@ def main() -> None:
         "pending": len(pending),
     }), flush=True)
 
-    try:
-        ok, errors = run_pending(args, pending)
-    finally:
-        PROMPT_CACHE.delete()
-    write_report(args.output, args.report, len(rows))
+    cache_started = time.time()
+    ok = errors = 0
+    if pending:
+        try:
+            with args.output.open("a", encoding="utf-8", buffering=1) as handle:
+                if args.sync:
+                    ok, errors = run_sync(args, pending, handle)
+                else:
+                    ok, errors = run_batch(args, pending, handle)
+        finally:
+            # A batch job that is still pending (interrupted run) keeps its
+            # cache alive so the queued requests can still reference it.
+            if not args.sync and batch_state_path(args.output).is_file():
+                print(json.dumps({
+                    "batch_job_left_running": True,
+                    "note": "rerun the same command to resume polling and collect results",
+                }), flush=True)
+            else:
+                PROMPT_CACHE.delete()
+    write_report(args.output, args.report, len(rows), cache_started)
     print(json.dumps({"finished": True, "ok": ok, "errors": errors}), flush=True)
 
 
-def run_pending(args: argparse.Namespace, pending: list[dict[str, Any]]) -> tuple[int, int]:
+def run_sync(
+    args: argparse.Namespace, pending: list[dict[str, Any]], handle: Any
+) -> tuple[int, int]:
     ok = errors = 0
-    with args.output.open("a", encoding="utf-8", buffering=1) as handle:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(infer, row, args.max_attempts): row for row in pending}
-            for index, future in enumerate(concurrent.futures.as_completed(futures), start=1):
-                result = future.result()
-                handle.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n")
-                handle.flush()
-                if result["status"] == "ok":
-                    ok += 1
-                else:
-                    errors += 1
-                print(json.dumps({
-                    "done_this_run": index,
-                    "ok_this_run": ok,
-                    "errors_this_run": errors,
-                    "id": result["id"],
-                    "status": result["status"],
-                }, ensure_ascii=False), flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(infer, row, args.max_attempts): row for row in pending}
+        for index, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+            result = future.result()
+            handle.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+            if result["status"] == "ok":
+                ok += 1
+            else:
+                errors += 1
+            print(json.dumps({
+                "done_this_run": index,
+                "ok_this_run": ok,
+                "errors_this_run": errors,
+                "id": result["id"],
+                "status": result["status"],
+            }, ensure_ascii=False), flush=True)
     return ok, errors
 
 
